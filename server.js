@@ -5,10 +5,14 @@ const { spawn } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const crypto = require("crypto"); // needed for /upload-init
+const crypto = require("crypto");
 
 // AWS SDK v3
-const { S3Client, GetObjectCommand, PutObjectCommand } = require("@aws-sdk/client-s3");
+const {
+  S3Client,
+  GetObjectCommand,
+  PutObjectCommand,
+} = require("@aws-sdk/client-s3");
 const { Upload } = require("@aws-sdk/lib-storage");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
@@ -30,13 +34,16 @@ app.use(express.json({ limit: "10mb" }));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 /**
- * POST /upload-init
- * body: { filename: string, contentType: string }
- * returns: { put_url, file_url, key }
+ * Create a presigned PUT URL so the browser/CLI can upload directly to S3.
+ * Body: { "filename": "myvideo.mp4", "contentType": "video/mp4" }
+ * Returns: { put_url, file_url, key }
  */
 app.post("/upload-init", async (req, res) => {
   try {
-    const { filename = `upload_${Date.now()}.mp4`, contentType = "video/mp4" } = req.body || {};
+    const {
+      filename = `upload_${Date.now()}.mp4`,
+      contentType = "video/mp4",
+    } = req.body || {};
     const key = `uploads/${crypto.randomBytes(8).toString("hex")}_${filename}`;
 
     const command = new PutObjectCommand({
@@ -50,42 +57,106 @@ app.post("/upload-init", async (req, res) => {
 
     res.json({ put_url, file_url, key });
   } catch (e) {
-    res.status(500).json({ error: "upload-init failed", detail: String(e?.message || e) });
+    res
+      .status(500)
+      .json({ error: "upload-init failed", detail: String(e?.message || e) });
   }
 });
 
 /**
+ * Helper: if input_url points to our private S3 object, return a signed GET URL
+ */
+async function maybeSignInputUrl(inputUrl) {
+  try {
+    const u = new URL(inputUrl);
+    const vhost = `${BUCKET}.s3.${REGION}.amazonaws.com`;
+    const pathStyleHost = `s3.${REGION}.amazonaws.com`;
+
+    // Virtual-hosted–style: https://<bucket>.s3.<region>.amazonaws.com/<key>
+    if (u.hostname === vhost) {
+      const key = decodeURIComponent(u.pathname.replace(/^\/+/, ""));
+      return await getSignedUrl(
+        s3,
+        new GetObjectCommand({ Bucket: BUCKET, Key: key }),
+        { expiresIn: 60 * 10 }
+      );
+    }
+
+    // Path-style: https://s3.<region>.amazonaws.com/<bucket>/<key>
+    if (u.hostname === pathStyleHost) {
+      const parts = u.pathname.replace(/^\/+/, "").split("/");
+      if (parts[0] === BUCKET && parts.length > 1) {
+        const key = decodeURIComponent(parts.slice(1).join("/"));
+        return await getSignedUrl(
+          s3,
+          new GetObjectCommand({ Bucket: BUCKET, Key: key }),
+          { expiresIn: 60 * 10 }
+        );
+      }
+    }
+  } catch {
+    // ignore and fall through
+  }
+  return inputUrl; // non-S3 or different bucket: use as-is
+}
+
+/**
  * POST /render
  * body: { input_url: string, in_s: number, out_s: number }
+ * - Cuts a clip with ffmpeg
+ * - Uploads to S3 at clips/clip_<id>.mp4 (private)
+ * - Returns signed GET URL for the clip
  */
 app.post("/render", async (req, res) => {
   try {
     const { input_url, in_s, out_s } = req.body || {};
     if (!input_url) return res.status(400).json({ error: "Missing input_url" });
     if (typeof in_s !== "number" || typeof out_s !== "number") {
-      return res.status(400).json({ error: "in_s and out_s must be numbers (seconds)" });
+      return res
+        .status(400)
+        .json({ error: "in_s and out_s must be numbers (seconds)" });
     }
-    if (out_s <= in_s) return res.status(400).json({ error: "out_s must be greater than in_s" });
-    if (out_s - in_s > 90) return res.status(400).json({ error: "clip too long (max 90s)" });
+    if (out_s <= in_s)
+      return res
+        .status(400)
+        .json({ error: "out_s must be greater than in_s" });
+    if (out_s - in_s > 90)
+      return res.status(400).json({ error: "clip too long (max 90s)" });
+
+    // If the input is our S3 bucket, sign it so ffmpeg can read it
+    const effectiveInputUrl = await maybeSignInputUrl(input_url);
 
     const id = Date.now().toString(36);
     const tmpOut = path.join(os.tmpdir(), `clip_${id}.mp4`);
 
     // 1080x1920 vertical canvas (letterbox/pillarbox as needed)
-    const vf = "scale=1080:-1:force_original_aspect_ratio=decrease,pad=1080:1920:(1080-iw)/2:(1920-ih)/2";
+    const vf =
+      "scale=1080:-1:force_original_aspect_ratio=decrease,pad=1080:1920:(1080-iw)/2:(1920-ih)/2";
 
     const args = [
-      "-ss", String(in_s),
-      "-to", String(out_s),
-      "-i", input_url,
-      "-vf", vf,
-      "-r", "30",
-      "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-      "-c:a", "aac", "-b:a", "128k",
-      tmpOut
+      "-ss",
+      String(in_s),
+      "-to",
+      String(out_s),
+      "-i",
+      effectiveInputUrl,
+      "-vf",
+      vf,
+      "-r",
+      "30",
+      "-c:v",
+      "libx264",
+      "-preset",
+      "veryfast",
+      "-crf",
+      "20",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "128k",
+      tmpOut,
     ];
 
-    // Run ffmpeg
     const ff = spawn("ffmpeg", args);
     let stderr = "";
     ff.stderr.on("data", (d) => (stderr += d.toString()));
@@ -94,10 +165,11 @@ app.post("/render", async (req, res) => {
     ff.on("close", async (code) => {
       if (code !== 0) {
         console.error("ffmpeg failed:", stderr);
-        return res.status(500).json({ error: "ffmpeg failed", detail: stderr.slice(-1200) });
+        return res
+          .status(500)
+          .json({ error: "ffmpeg failed", detail: stderr.slice(-1200) });
       }
 
-      // Upload to S3 (private), then return a signed URL
       const key = `clips/clip_${id}.mp4`;
       try {
         const uploader = new Upload({
@@ -110,13 +182,12 @@ app.post("/render", async (req, res) => {
           },
         });
         await uploader.done();
-
-        fs.unlink(tmpOut, () => {}); // clean up temp file
+        fs.unlink(tmpOut, () => {});
 
         const signedUrl = await getSignedUrl(
           s3,
           new GetObjectCommand({ Bucket: BUCKET, Key: key }),
-          { expiresIn: 60 * 60 * 24 }
+          { expiresIn: 60 * 60 * 24 } // 24h
         );
 
         return res.json({
@@ -127,7 +198,9 @@ app.post("/render", async (req, res) => {
         });
       } catch (e) {
         console.error("S3 upload error:", e);
-        return res.status(500).json({ error: "s3 upload failed", detail: String(e?.message || e) });
+        return res
+          .status(500)
+          .json({ error: "s3 upload failed", detail: String(e?.message || e) });
       }
     });
   } catch (e) {
@@ -140,5 +213,4 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`FFmpeg worker (S3) running on port ${PORT}`);
 });
-
 
