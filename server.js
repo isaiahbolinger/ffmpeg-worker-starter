@@ -5,9 +5,10 @@ const { spawn } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const crypto = require("crypto"); // needed for /upload-init
 
 // AWS SDK v3
-const { S3Client, GetObjectCommand } = require("@aws-sdk/client-s3");
+const { S3Client, GetObjectCommand, PutObjectCommand } = require("@aws-sdk/client-s3");
 const { Upload } = require("@aws-sdk/lib-storage");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
@@ -27,6 +28,31 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
+
+/**
+ * POST /upload-init
+ * body: { filename: string, contentType: string }
+ * returns: { put_url, file_url, key }
+ */
+app.post("/upload-init", async (req, res) => {
+  try {
+    const { filename = `upload_${Date.now()}.mp4`, contentType = "video/mp4" } = req.body || {};
+    const key = `uploads/${crypto.randomBytes(8).toString("hex")}_${filename}`;
+
+    const command = new PutObjectCommand({
+      Bucket: BUCKET,
+      Key: key,
+      ContentType: contentType,
+    });
+
+    const put_url = await getSignedUrl(s3, command, { expiresIn: 60 * 10 }); // 10 min
+    const file_url = `https://${BUCKET}.s3.${REGION}.amazonaws.com/${key}`;
+
+    res.json({ put_url, file_url, key });
+  } catch (e) {
+    res.status(500).json({ error: "upload-init failed", detail: String(e?.message || e) });
+  }
+});
 
 /**
  * POST /render
@@ -85,10 +111,8 @@ app.post("/render", async (req, res) => {
         });
         await uploader.done();
 
-        // optional: remove local temp file
-        fs.unlink(tmpOut, () => {});
+        fs.unlink(tmpOut, () => {}); // clean up temp file
 
-        // Signed GET URL (expires in 24h)
         const signedUrl = await getSignedUrl(
           s3,
           new GetObjectCommand({ Bucket: BUCKET, Key: key }),
@@ -116,4 +140,5 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`FFmpeg worker (S3) running on port ${PORT}`);
 });
+
 
